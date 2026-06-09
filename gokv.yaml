@@ -1,0 +1,15 @@
+server:
+  host: "127.0.0.1"
+  port: "8000"
+cluster:
+  secret: "SuperSecretClusterKey123!@#"
+  seed: ""
+storage:
+  capacity: 2048
+users:
+  - username: "boss"
+    password: "admin_password123"
+    role: "admin"
+  - username: "guest"
+    password: "readonly_password123"
+    role: "reader"
