@@ -104,12 +104,4 @@ OK
 # Read data
 127.0.0.1:8000> GET user:100
 "Ali"
-
 ```
-
-### Key adjustments made for your project:
-1. **Removed TLS/SSL and DLM:** Your current code utilizes standard TCP (`net.Listen`) and standard mutexes/Lamport clocks rather than TLS and a Distributed Lock Manager. Mentioning them previously could confuse users reading your source code.
-2. **Added Lamport Clocks:** Highlighted the `internal/clock/lamport.go` implementation used for syncing cluster nodes.
-3. **Added Sharding & LRU:** Highlighted your `internal/storage/storage.go` architecture (the 16 Shards and Linked-List LRU eviction process).
-4. **Corrected Configuration:** Brought the `gokv.yaml` config block exactly in line with the structure your app parses.
-5. **Adjusted CLI Command:** Removed the `--tls --insecure` flags from the `redis-cli` example so it works perfectly out-of-the-box with your TCP listener.
