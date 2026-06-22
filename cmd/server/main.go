@@ -186,6 +186,11 @@ func handleClient(conn net.Conn, ring *routing.HashRing, store storage.Storage, 
 			protocol.WriteError(conn, "NOAUTH Authentication required.")
 			continue
 		}
+		
+		if command == "PING" {
+			protocol.WriteSimpleString(conn, "PONG")
+			continue
+		}
 
 		if len(parts) < 2 {
 			protocol.WriteError(conn, "wrong number of arguments")
@@ -209,10 +214,8 @@ func handleClient(conn net.Conn, ring *routing.HashRing, store storage.Storage, 
 			lClock.Update(incomingVersion)
 
 			if command == "_SYNC_SET" && len(parts) >= 4 {
-
 				store.Set(key, parts[2], incomingVersion)
 			} else if command == "_SYNC_DEL" && len(parts) >= 3 {
-
 				store.Delete(key, incomingVersion)
 			}
 			protocol.WriteSimpleString(conn, "OK")
@@ -229,7 +232,6 @@ func handleClient(conn net.Conn, ring *routing.HashRing, store storage.Storage, 
 			answered := false
 			for _, node := range replicas {
 				if node == myAddr {
-
 					val, _, err := store.Get(key)
 					if err == nil {
 						protocol.WriteBulkString(conn, val)
@@ -268,7 +270,6 @@ func handleClient(conn net.Conn, ring *routing.HashRing, store storage.Storage, 
 						store.Delete(key, newVersion)
 					}
 				} else {
-
 					var syncParts []string
 					if command == "SET" {
 						syncParts = []string{"_SYNC_SET", key, parts[2], versionStr}
@@ -277,12 +278,14 @@ func handleClient(conn net.Conn, ring *routing.HashRing, store storage.Storage, 
 					}
 
 					go forwardCommandToNode(node, syncParts, users)
-					fmt.Printf("[REPLICATION] Sent backup of '%s' (v:%d) to %s\n", key, newVersion, node)
+					// fmt.Printf("[REPLICATION] Sent backup of '%s' (v:%d) to %s\n", key, newVersion, node)
 				}
 			}
 
 			protocol.WriteSimpleString(conn, "OK")
+			continue
 		}
+		protocol.WriteError(conn, "ERR unknown command '"+command+"'")
 	}
 }
 
