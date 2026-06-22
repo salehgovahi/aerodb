@@ -7,8 +7,9 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"hash/fnv" 
+	"hash/fnv"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,17 +17,18 @@ import (
 
 var ErrKeyNotFound = errors.New("key not found")
 
-const ShardCount = 16 
+const ShardCount = 16
 
 type Storage interface {
-	Set(key string, value string)
-	Get(key string) (string, error)
-	Delete(key string) error
+	Set(key string, value string, version int64) bool
+	Get(key string) (string, int64, error)
+	Delete(key string, version int64)
 }
 
 type entry struct {
-	key   string
-	value string
+	key     string
+	value   string
+	version int64
 }
 
 type cacheShard struct {
@@ -36,14 +38,19 @@ type cacheShard struct {
 }
 
 type MemoryStorage struct {
-	shards       [ShardCount]*cacheShard 
-	capacity     int                     
+	shards       [ShardCount]*cacheShard
+	capacity     int
 	filename     string
 	walFilename  string
 	walFile      *os.File
-	walMu        sync.Mutex 
+	walMu        sync.Mutex
 	dirtyCounter int
-	dirtyMu      sync.Mutex 
+	dirtyMu      sync.Mutex
+}
+
+type Record struct {
+	Value   string
+	Version int64
 }
 
 func NewMemoryStorage(filename string, capacity int) *MemoryStorage {
@@ -55,7 +62,6 @@ func NewMemoryStorage(filename string, capacity int) *MemoryStorage {
 		walFilename: walName,
 	}
 
-	
 	for i := range ShardCount {
 		s.shards[i] = &cacheShard{
 			ll:    list.New(),
@@ -77,7 +83,6 @@ func NewMemoryStorage(filename string, capacity int) *MemoryStorage {
 	return s
 }
 
-
 func (s *MemoryStorage) getShard(key string) *cacheShard {
 	h := fnv.New32a()
 	h.Write([]byte(key))
@@ -85,13 +90,15 @@ func (s *MemoryStorage) getShard(key string) *cacheShard {
 	return s.shards[shardIndex]
 }
 
-func (s *MemoryStorage) restoreData(key, value string) {
+func (s *MemoryStorage) restoreData(key, value string, version int64) {
 	shard := s.getShard(key)
 	if ele, hit := shard.cache[key]; hit {
 		shard.ll.MoveToFront(ele)
-		ele.Value.(*entry).value = value
+		ent := ele.Value.(*entry)
+		ent.value = value
+		ent.version = version
 	} else {
-		ele := shard.ll.PushFront(&entry{key, value})
+		ele := shard.ll.PushFront(&entry{key: key, value: value, version: version})
 		shard.cache[key] = ele
 	}
 }
@@ -104,33 +111,33 @@ func (s *MemoryStorage) removeData(key string) {
 	}
 }
 
-
-func (s *MemoryStorage) appendToWAL(command, key, value string) {
+func (s *MemoryStorage) appendToWAL(command, key, value string, version int64) {
 	s.walMu.Lock()
 	defer s.walMu.Unlock()
 
 	var line string
 	if command == "SET" {
-		line = fmt.Sprintf("SET %s %s\n", key, value)
+
+		line = fmt.Sprintf("SET %s %d %s\n", key, version, value)
 	} else {
-		line = fmt.Sprintf("DEL %s\n", key)
+
+		line = fmt.Sprintf("DEL %s %d\n", key, version)
 	}
 	s.walFile.WriteString(line)
 	s.walFile.Sync()
 }
 
-
 func (s *MemoryStorage) SaveSnapshot() error {
-	snapshotData := make(map[string]string)
+	snapshotData := make(map[string]Record)
 
 	for i := range ShardCount {
 		shard := s.shards[i]
 		shard.mu.Lock()
 		for e := shard.ll.Front(); e != nil; e = e.Next() {
 			kv := e.Value.(*entry)
-			snapshotData[kv.key] = kv.value
+			snapshotData[kv.key] = Record{Value: kv.value, Version: kv.version}
 		}
-		shard.mu.Unlock() 
+		shard.mu.Unlock()
 	}
 
 	var buf bytes.Buffer
@@ -150,41 +157,51 @@ func (s *MemoryStorage) SaveSnapshot() error {
 	return err
 }
 
-func (s *MemoryStorage) Set(key string, value string) {
-	s.appendToWAL("SET", key, value)
+func (s *MemoryStorage) Set(key string, value string, version int64) bool {
+	shard := s.getShard(key)
+	shard.mu.Lock()
+
+	if ele, hit := shard.cache[key]; hit {
+		ent := ele.Value.(*entry)
+		if version <= ent.version {
+			shard.mu.Unlock()
+			return false
+		}
+		ent.value = value
+		ent.version = version
+		shard.ll.MoveToFront(ele)
+	} else {
+		ele := shard.ll.PushFront(&entry{key: key, value: value, version: version})
+		shard.cache[key] = ele
+	}
+	shard.mu.Unlock()
+
+	s.appendToWAL("SET", key, value, version)
 
 	s.dirtyMu.Lock()
 	s.dirtyCounter++
 	s.dirtyMu.Unlock()
 
-	shard := s.getShard(key)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	if ele, hit := shard.cache[key]; hit {
-		shard.ll.MoveToFront(ele)
-		ele.Value.(*entry).value = value
-	} else {
-		ele := shard.ll.PushFront(&entry{key, value})
-		shard.cache[key] = ele
-	}
-
-	
 	shardCapacity := s.capacity / ShardCount
 	if s.capacity > 0 && shard.ll.Len() > shardCapacity {
 		s.evictOldestFromShard(shard)
 	}
+
+	return true
 }
 
 func (s *MemoryStorage) evictOldestFromShard(shard *cacheShard) {
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
 	ele := shard.ll.Back()
 	if ele != nil {
 		kv := ele.Value.(*entry)
 		shard.ll.Remove(ele)
 		delete(shard.cache, kv.key)
-		
-		s.appendToWAL("DEL", kv.key, "")
-		
+
+		go s.appendToWAL("DEL", kv.key, "", kv.version)
+
 		s.dirtyMu.Lock()
 		s.dirtyCounter++
 		s.dirtyMu.Unlock()
@@ -192,38 +209,42 @@ func (s *MemoryStorage) evictOldestFromShard(shard *cacheShard) {
 	}
 }
 
-func (s *MemoryStorage) Get(key string) (string, error) {
-	shard := s.getShard(key)
-	shard.mu.Lock() 
-	defer shard.mu.Unlock()
-
-	if ele, hit := shard.cache[key]; hit {
-		shard.ll.MoveToFront(ele)
-		return ele.Value.(*entry).value, nil
-	}
-	return "", ErrKeyNotFound
-}
-
-func (s *MemoryStorage) Delete(key string) error {
-	s.appendToWAL("DEL", key, "")
-
-	s.dirtyMu.Lock()
-	s.dirtyCounter++
-	s.dirtyMu.Unlock()
-
+func (s *MemoryStorage) Get(key string) (string, int64, error) {
 	shard := s.getShard(key)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	if ele, hit := shard.cache[key]; hit {
-		shard.ll.Remove(ele)
-		delete(shard.cache, key)
-		return nil
+		shard.ll.MoveToFront(ele)
+		ent := ele.Value.(*entry)
+		return ent.value, ent.version, nil
 	}
-	return ErrKeyNotFound
+	return "", 0, ErrKeyNotFound
 }
 
+func (s *MemoryStorage) Delete(key string, version int64) {
+	shard := s.getShard(key)
+	shard.mu.Lock()
 
+	deleted := false
+	if ele, hit := shard.cache[key]; hit {
+		ent := ele.Value.(*entry)
+
+		if version >= ent.version {
+			shard.ll.Remove(ele)
+			delete(shard.cache, key)
+			deleted = true
+		}
+	}
+	shard.mu.Unlock()
+
+	if deleted {
+		s.appendToWAL("DEL", key, "", version)
+		s.dirtyMu.Lock()
+		s.dirtyCounter++
+		s.dirtyMu.Unlock()
+	}
+}
 
 func (s *MemoryStorage) replayWAL() {
 	file, err := os.Open(s.walFilename)
@@ -236,14 +257,20 @@ func (s *MemoryStorage) replayWAL() {
 	count := 0
 	for scanner.Scan() {
 		line := scanner.Text()
-		parts := strings.SplitN(line, " ", 3)
-		if len(parts) < 2 {
+
+		parts := strings.SplitN(line, " ", 4)
+		if len(parts) < 3 {
 			continue
 		}
 
 		cmd, key := parts[0], parts[1]
-		if cmd == "SET" && len(parts) == 3 {
-			s.restoreData(key, parts[2])
+		version, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil {
+			continue
+		}
+
+		if cmd == "SET" && len(parts) == 4 {
+			s.restoreData(key, parts[3], version)
 			count++
 		} else if cmd == "DEL" {
 			s.removeData(key)
@@ -263,8 +290,8 @@ func (s *MemoryStorage) LoadSnapshot() {
 
 	buf := bytes.NewBuffer(bytesData)
 	decoder := gob.NewDecoder(buf)
-	
-	var snapshotData map[string]string
+
+	var snapshotData map[string]Record
 	err = decoder.Decode(&snapshotData)
 	if err != nil {
 		fmt.Println("[STORAGE] Error decoding snapshot:", err)
@@ -272,9 +299,9 @@ func (s *MemoryStorage) LoadSnapshot() {
 	}
 
 	for k, v := range snapshotData {
-		s.restoreData(k, v)
+		s.restoreData(k, v.Value, v.Version)
 	}
-	
+
 	totalItems := 0
 	for i := 0; i < ShardCount; i++ {
 		totalItems += len(s.shards[i].cache)

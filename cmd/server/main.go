@@ -4,15 +4,17 @@ import (
 	"bufio"
 	"crypto/subtle"
 	"fmt"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"aerodb/internal/clock"
 	"aerodb/internal/cluster"
-	"aerodb/internal/dlock"
 	"aerodb/internal/protocol"
 	"aerodb/internal/routing"
 	"aerodb/internal/storage"
-	"net"
-	"os"
-	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -74,14 +76,14 @@ func main() {
 
 	c := cluster.NewCluster(myAddr, cfg.Cluster.Seed, cfg.Cluster.Secret)
 
-	dlm := dlock.NewLockManager()
+	lClock := clock.NewLamportClock()
 
 	go c.StartListening(cfg.Server.Port)
 	go c.StartGossiping()
 
 	go syncRingWithCluster(c, hashRing)
 
-	startTCPServer(cfg.Server.Port, hashRing, store, myAddr, cfg.Users, dlm)
+	startTCPServer(cfg.Server.Port, hashRing, store, myAddr, cfg.Users, lClock)
 }
 
 func syncRingWithCluster(c *cluster.Cluster, ring *routing.HashRing) {
@@ -117,7 +119,7 @@ func syncRingWithCluster(c *cluster.Cluster, ring *routing.HashRing) {
 	}
 }
 
-func startTCPServer(port string, ring *routing.HashRing, store storage.Storage, myAddr string, users []UserConf, dlm *dlock.LockManager) {
+func startTCPServer(port string, ring *routing.HashRing, store storage.Storage, myAddr string, users []UserConf, lClock *clock.LamportClock) {
 	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		panic(err)
@@ -130,11 +132,11 @@ func startTCPServer(port string, ring *routing.HashRing, store storage.Storage, 
 			continue
 		}
 
-		go handleClient(conn, ring, store, myAddr, users, dlm)
+		go handleClient(conn, ring, store, myAddr, users, lClock)
 	}
 }
 
-func handleClient(conn net.Conn, ring *routing.HashRing, store storage.Storage, myAddr string, users []UserConf, dlm *dlock.LockManager) {
+func handleClient(conn net.Conn, ring *routing.HashRing, store storage.Storage, myAddr string, users []UserConf, lClock *clock.LamportClock) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
@@ -191,40 +193,30 @@ func handleClient(conn net.Conn, ring *routing.HashRing, store storage.Storage, 
 		}
 		key := parts[1]
 
-		if command == "_LOCK" {
-			if dlm.TryLock(key, 5*time.Second) {
-				protocol.WriteSimpleString(conn, "OK")
-			} else {
-				protocol.WriteError(conn, "LOCKED")
-			}
-			continue
-		}
-
-		if command == "_UNLOCK" {
-			dlm.Unlock(key)
-			protocol.WriteSimpleString(conn, "OK")
-			continue
-		}
-
 		if command == "_SYNC_SET" || command == "_SYNC_DEL" {
 			if currentRole != "admin" {
 				protocol.WriteError(conn, "ERR unauthorized for cluster sync")
 				continue
 			}
-			if command == "_SYNC_SET" && len(parts) >= 3 {
-				store.Set(key, parts[2])
-			} else if command == "_SYNC_DEL" {
-				store.Delete(key)
+
+			versionStr := parts[len(parts)-1]
+			incomingVersion, err := strconv.ParseInt(versionStr, 10, 64)
+			if err != nil {
+				protocol.WriteError(conn, "ERR invalid version format")
+				continue
+			}
+
+			lClock.Update(incomingVersion)
+
+			if command == "_SYNC_SET" && len(parts) >= 4 {
+
+				store.Set(key, parts[2], incomingVersion)
+			} else if command == "_SYNC_DEL" && len(parts) >= 3 {
+
+				store.Delete(key, incomingVersion)
 			}
 			protocol.WriteSimpleString(conn, "OK")
 			continue
-		}
-
-		if command == "SET" || command == "DEL" {
-			if currentRole != "admin" {
-				protocol.WriteError(conn, "ERR unauthorized operation")
-				continue
-			}
 		}
 
 		replicas := ring.GetReplicas(key, 2)
@@ -237,7 +229,8 @@ func handleClient(conn net.Conn, ring *routing.HashRing, store storage.Storage, 
 			answered := false
 			for _, node := range replicas {
 				if node == myAddr {
-					val, err := store.Get(key)
+
+					val, _, err := store.Get(key)
 					if err == nil {
 						protocol.WriteBulkString(conn, val)
 						answered = true
@@ -259,47 +252,33 @@ func handleClient(conn net.Conn, ring *routing.HashRing, store storage.Storage, 
 		}
 
 		if command == "SET" || command == "DEL" {
-			owner := replicas[0]
-			lockAcquired := false
-
-			if owner == myAddr {
-				lockAcquired = dlm.TryLock(key, 5*time.Second)
-			} else {
-				lockResp, err := forwardCommandToNode(owner, []string{"_LOCK", key}, users)
-				if err == nil && string(lockResp) == "+OK\r\n" {
-					lockAcquired = true
-				}
-			}
-
-			if !lockAcquired {
-				protocol.WriteError(conn, "ERR resource is temporarily locked by another transaction")
+			if currentRole != "admin" {
+				protocol.WriteError(conn, "ERR unauthorized operation")
 				continue
 			}
+
+			newVersion := lClock.Increment()
+			versionStr := strconv.FormatInt(newVersion, 10)
 
 			for _, node := range replicas {
 				if node == myAddr {
 					if command == "SET" && len(parts) >= 3 {
-						store.Set(key, parts[2])
+						store.Set(key, parts[2], newVersion)
 					} else if command == "DEL" {
-						store.Delete(key)
+						store.Delete(key, newVersion)
 					}
 				} else {
-					syncParts := make([]string, len(parts))
-					copy(syncParts, parts)
-					if command == "SET" {
-						syncParts[0] = "_SYNC_SET"
-					} else if command == "DEL" {
-						syncParts[0] = "_SYNC_DEL"
-					}
-					go forwardCommandToNode(node, syncParts, users)
-					fmt.Printf("[REPLICATION] Sent backup of '%s' to %s\n", key, node)
-				}
-			}
 
-			if owner == myAddr {
-				dlm.Unlock(key)
-			} else {
-				go forwardCommandToNode(owner, []string{"_UNLOCK", key}, users)
+					var syncParts []string
+					if command == "SET" {
+						syncParts = []string{"_SYNC_SET", key, parts[2], versionStr}
+					} else if command == "DEL" {
+						syncParts = []string{"_SYNC_DEL", key, versionStr}
+					}
+
+					go forwardCommandToNode(node, syncParts, users)
+					fmt.Printf("[REPLICATION] Sent backup of '%s' (v:%d) to %s\n", key, newVersion, node)
+				}
 			}
 
 			protocol.WriteSimpleString(conn, "OK")
@@ -332,7 +311,7 @@ func forwardCommandToNode(node string, parts []string, users []UserConf) ([]byte
 
 	conn.Write([]byte(fmt.Sprintf("*%d\r\n", len(parts))))
 	for _, p := range parts {
-		conn.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(p), p)))
+		fmt.Fprintf(conn, "$%d\r\n%s\r\n", len(p), p)
 	}
 
 	buf := make([]byte, 1024)
