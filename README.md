@@ -8,7 +8,7 @@
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
 - **Masterless Architecture:** No single point of failure. Every node is an equal peer and can act as a coordinator for client requests.
 - **Consistent Hashing:** Uses a Hash Ring with virtual nodes (3 replicas) for efficient data distribution and minimal rehashing when cluster topology changes.
@@ -25,7 +25,7 @@
 
 ---
 
-## 🏗 Architecture Overview
+## Architecture Overview
 
 AeroDB strictly separates cluster topology management from data storage:
 
@@ -35,9 +35,30 @@ AeroDB strictly separates cluster topology management from data storage:
 
 ---
 
-## 🛠 Getting Started
+## Benchmarks & Performance
+
+AeroDB is designed to handle concurrent operations efficiently using lock-striping and asynchronous replication. The performance was evaluated using the standard `redis-benchmark` tool on a **3-Node local cluster** with authentication enabled, simulating real-world network routing and replication overhead.
+
+**Test Methodology:** To rigorously test the Consistent Hash Ring distribution and concurrent load handling, the benchmark was configured to process a total of **100,000 requests** across **100,000 randomized keys** using 100 concurrent client connections.
+
+**Results:**
+
+| Operation | Throughput (Req/Sec) | p50 Latency |
+| --- | --- | --- |
+| **SET** | ~ 1,478 ops/sec | 60.63 msec |
+| **GET** | ~ 199 ops/sec | 23.29 msec |
+
+*Architectural Note:* You might notice that `SET` operations yield higher throughput than `GET` operations. This is a deliberate design choice in AeroDB's masterless architecture:
+
+* **Writes (SET)** are replicated *asynchronously*. The coordinator node writes locally and returns `OK` to the client immediately, while background goroutines securely sync the data to replica nodes.
+* **Reads (GET)** are strictly routed. If a client queries a node that doesn't own the requested data (based on the Hash Ring), the node *synchronously* forwards the request to the correct owner over a new TCP connection and waits for the response before replying to the client.
+
+---
+
+## Getting Started
 
 ### 1. Configuration (`gokv.yaml`)
+
 Create a `gokv.yaml` file in the root directory to define the server, cluster secret, storage capacity, and user roles:
 
 ```yaml
@@ -86,7 +107,7 @@ GOKV_PORT=8002 GOKV_SEED=127.0.0.1:8000 go run ./cmd/server/main.go
 
 ---
 
-## 💻 Usage (Client Interaction)
+## Usage (Client Interaction)
 
 Because AeroDB speaks RESP, you don't need a custom client. Simply use `redis-cli`:
 
